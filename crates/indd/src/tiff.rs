@@ -32,10 +32,11 @@ impl<'a> Ifd<'a> {
         let off = ifd.u32(4)? as usize;
         let n = ifd.u16(off)? as usize;
         for i in 0..n.min(512) {
-            let e = off + 2 + 12 * i;
-            let (tag, typ, count) = (ifd.u16(e)?, ifd.u16(e + 2)?, ifd.u32(e + 4)?);
+            // `off` comes from the file: on 32-bit targets these sums can overflow.
+            let e = off.checked_add(2 + 12 * i)?;
+            let (tag, typ, count) = (ifd.u16(e)?, ifd.u16(e.checked_add(2)?)?, ifd.u32(e.checked_add(4)?)?);
             // A single SHORT value sits in the first two bytes of the value field.
-            let value = if typ == 3 && count == 1 { u32::from(ifd.u16(e + 8)?) } else { ifd.u32(e + 8)? };
+            let value = if typ == 3 && count == 1 { u32::from(ifd.u16(e.checked_add(8)?)?) } else { ifd.u32(e.checked_add(8)?)? };
             ifd.entries.push((tag, typ, count, value));
         }
         Some(ifd)
@@ -58,21 +59,26 @@ impl<'a> Ifd<'a> {
             return Some(if typ == 3 && count == 2 { vec![value & 0xFFFF, value >> 16] } else { vec![value] });
         }
         (0..count.min(1 << 20))
-            .map(|i| if typ == 3 { self.u16(value as usize + 2 * i).map(u32::from) } else { self.u32(value as usize + 4 * i) })
+            .map(|i| {
+                let off = (value as usize).checked_add(i.checked_mul(size)?)?;
+                if typ == 3 { self.u16(off).map(u32::from) } else { self.u32(off) }
+            })
             .collect()
     }
 }
 
 fn packbits(src: &[u8], want: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(want);
+    // `want` comes from the header; the data decides how much is really produced.
+    let mut out = Vec::with_capacity(want.min(src.len()));
     let mut i = 0;
-    while i < src.len() && out.len() < want {
-        let n = src[i] as i8;
+    while out.len() < want {
+        let Some(&b) = src.get(i) else { break };
+        let n = b as i8;
         i += 1;
         if n >= 0 {
             let len = n as usize + 1;
             out.extend_from_slice(clamp(src, i, len));
-            i += len;
+            i = i.saturating_add(len);
         } else if n != -128 {
             let Some(&b) = src.get(i) else { break };
             out.extend(std::iter::repeat_n(b, (1 - i32::from(n)) as usize));
@@ -101,16 +107,26 @@ pub(crate) fn palette_to_png(data: &[u8]) -> Option<Vec<u8>> {
     }
     let offsets = ifd.values(273)?;
     let counts = ifd.values(279)?;
-    let mut raw = Vec::with_capacity(w * h * spp);
+    let want = w.checked_mul(h)?.checked_mul(spp)?;
+    // The header sizes are not trusted for allocations: the strips decide how much is read.
+    let mut raw = Vec::with_capacity(want.min(data.len()));
     for (o, c) in offsets.iter().zip(&counts) {
+        // Strips may repeat; stop once the image is complete.
+        if raw.len() >= want {
+            break;
+        }
         let strip = slice(data, *o as usize, *c as usize)?;
         match compression {
-            1 => raw.extend_from_slice(strip),
-            32773 => raw.extend(packbits(strip, w * h * spp - raw.len().min(w * h * spp))),
+            1 => raw.extend_from_slice(clamp(strip, 0, want.saturating_sub(raw.len()))),
+            32773 => raw.extend(packbits(strip, want.saturating_sub(raw.len()))),
             _ => return None,
         }
     }
-    let mut rgba = Vec::with_capacity(w * h * 4);
+    // Too few pixels for the declared size: reject before allocating the RGBA image.
+    if raw.len() < want {
+        return None;
+    }
+    let mut rgba = Vec::with_capacity(w.checked_mul(h)?.checked_mul(4)?);
     for px in raw.chunks_exact(spp).take(w * h) {
         let idx = px[0] as usize;
         let c = |k: usize| (map.get(k * 256 + idx).copied().unwrap_or(0) >> 8) as u8;

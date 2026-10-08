@@ -50,9 +50,40 @@ pub enum InddError {
     Damaged(String),
     #[error("writing IDML failed: {0}")]
     Write(String),
+    #[error("InDesign document is too large to import: {0}")]
+    TooLarge(&'static str),
 }
 
 pub type Result<T> = std::result::Result<T, InddError>;
+
+/// Upper bound for the bytes one conversion may hold, whatever the input size.
+const MAX_BUDGET: usize = 1 << 30;
+
+/// A byte budget shared by every allocation whose size the file controls (assembled objects,
+/// embedded files, decoded geometry, generated XML). Object locations can point many times at the
+/// same page and page items can name the same child many times, so the output could otherwise be
+/// thousands of times larger than the file.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Budget {
+    left: usize,
+}
+
+impl Budget {
+    /// `factor` × the input length, at least `floor` bytes and at most 1 GiB.
+    pub(crate) fn for_input(len: usize, factor: usize, floor: usize) -> Self {
+        Budget { left: len.saturating_mul(factor).max(floor).min(MAX_BUDGET) }
+    }
+
+    pub(crate) fn left(&self) -> usize {
+        self.left
+    }
+
+    /// Spends `n` bytes, or fails when the budget would be exceeded.
+    pub(crate) fn take(&mut self, n: usize, what: &'static str) -> Result<()> {
+        self.left = self.left.checked_sub(n).ok_or(InddError::TooLarge(what))?;
+        Ok(())
+    }
+}
 
 /// True when `bytes` start like an InDesign document (master page GUID + `DOCUMENT`).
 pub fn is_indd(bytes: &[u8]) -> bool {
@@ -67,7 +98,7 @@ pub fn to_idml(bytes: &[u8]) -> Result<Vec<u8>> {
 /// Like [`to_idml`], with the document name written into `designmap.xml`.
 pub fn to_idml_named(bytes: &[u8], name: &str) -> Result<Vec<u8>> {
     let c = container::Container::parse(bytes)?;
-    let mut doc = model::Builder::new(&c).build()?;
+    let mut doc = model::Builder::new(&c)?.build()?;
     doc.name = name.to_string();
-    writer::write(&doc)
+    writer::write_limited(&doc, Budget::for_input(bytes.len(), writer::OUTPUT_FACTOR, writer::OUTPUT_FLOOR))
 }

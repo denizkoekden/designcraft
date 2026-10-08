@@ -1,13 +1,14 @@
 //! Document model built from INDD objects.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use crate::attrs::{self, Attrs};
 use crate::bytes::{f64_at, transform, u16_at, u32_at, u32_list, u32s};
 use crate::container::Container;
 use crate::objects::{self, Obj};
 use crate::text::read_string;
-use crate::{InddError, Result};
+use crate::{Budget, InddError, Result};
 
 // Classes
 pub(crate) const C_SPREAD_LAYER_PAGE: u32 = 0x50F;
@@ -51,6 +52,15 @@ pub(crate) const TA_FONT: u32 = 0x1B2B;
 pub(crate) const TA_JUSTIFY: u32 = 0x1B7E;
 
 const MAX_DEPTH: usize = 32;
+/// Upper bound for page items in one document. Items may be named as children more than once,
+/// so without it a few objects could expand into billions of items.
+pub(crate) const MAX_ITEMS: usize = 100_000;
+/// Upper bound for spread layers and spread-layer entries visited (spreads may share layers and layers may
+/// repeat, so the visits are not bounded by the file size).
+const MAX_VISITS: usize = 1_000_000;
+/// The model may hold this many times the file size (objects, embedded files, geometry).
+const MODEL_FACTOR: usize = 8;
+const MODEL_FLOOR: usize = 1 << 20;
 
 #[derive(Debug, Clone)]
 pub struct Swatch {
@@ -77,9 +87,10 @@ pub struct Graphic {
     pub uid: u32,
     pub transform: [f64; 6],
     pub bounds: Option<[f64; 4]>,
-    pub data: Option<Vec<u8>>,
+    /// Embedded file; shared by every item that places the same file.
+    pub data: Option<Arc<[u8]>>,
     pub uri: Option<String>,
-    pub proxy: Option<Vec<u8>>,
+    pub proxy: Option<Arc<[u8]>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -164,11 +175,54 @@ pub struct Builder<'a> {
     c: &'a Container<'a>,
     objs: BTreeMap<u32, Obj>,
     default_stroke: f64,
+    budget: Budget,
+}
+
+/// State of the page-item walk: cycle detection, the item count and embedded files read so far.
+struct Walk<'f> {
+    f2s: &'f HashMap<u32, u32>,
+    /// UIDs from the spread layer down to the current item.
+    path: Vec<u32>,
+    items: usize,
+    visits: usize,
+    blobs: HashMap<u32, Option<Arc<[u8]>>>,
+    budget: Budget,
+}
+
+impl Walk<'_> {
+    /// Counts one spread layer or spread layer entry.
+    fn visit(&mut self) -> Result<()> {
+        self.visits = self.visits.saturating_add(1);
+        if self.visits > MAX_VISITS {
+            return Err(InddError::TooLarge("too many spread layer entries"));
+        }
+        Ok(())
+    }
+
+    /// An embedded file, read once per UID and charged to the budget once.
+    fn blob(&mut self, c: &Container<'_>, uid: u32) -> Result<Option<Arc<[u8]>>> {
+        if let Some(b) = self.blobs.get(&uid) {
+            return Ok(b.clone());
+        }
+        let data = match c.object_capped(uid, self.budget.left()) {
+            Ok(d) => {
+                self.budget.take(d.len(), "embedded files")?;
+                Some(Arc::from(d))
+            }
+            Err(e @ InddError::TooLarge(_)) => return Err(e),
+            Err(_) => None,
+        };
+        self.blobs.insert(uid, data.clone());
+        Ok(data)
+    }
 }
 
 impl<'a> Builder<'a> {
-    pub fn new(c: &'a Container<'a>) -> Self {
-        Builder { c, objs: objects::load(c), default_stroke: 1.0 }
+    /// Reads every object of the container, within a memory budget derived from the file size.
+    pub fn new(c: &'a Container<'a>) -> Result<Self> {
+        let mut budget = Budget::for_input(c.file_len(), MODEL_FACTOR, MODEL_FLOOR);
+        let objs = objects::load(c, &mut budget)?;
+        Ok(Builder { c, objs, default_stroke: 1.0, budget })
     }
 
     fn cls(&self, uid: u32) -> Option<u32> {
@@ -314,7 +368,7 @@ impl<'a> Builder<'a> {
         u32_at(h, 8).and_then(|n| u32s(h, 12, n as usize)).unwrap_or_default()
     }
 
-    fn graphic(&self, o: &Obj) -> Graphic {
+    fn graphic(&self, o: &Obj, w: &mut Walk<'_>) -> Result<Graphic> {
         let xf = transform(o.block(I_XFORM));
         let bounds = o.block(0x1633).filter(|b| b.len() >= 32).and_then(|b| Some([f64_at(b, 0)?, f64_at(b, 8)?, f64_at(b, 16)?, f64_at(b, 24)?]));
         let mut data = None;
@@ -323,32 +377,46 @@ impl<'a> Builder<'a> {
         let res = link.and_then(|l| self.block(l, 0x8C9B)).filter(|b| b.len() >= 12).and_then(|b| u32_at(b, 8));
         if let Some(rb) = res.and_then(|r| self.block(r, 0x8C92)) {
             uri = read_uri(rb);
-            let mut i = 0;
-            while i + 4 <= rb.len() {
-                if let Some(v) = u32_at(rb, i)
-                    && self.cls(v) == Some(C_BLOB)
-                {
-                    data = self.c.object(v).ok();
-                    break;
-                }
-                i += 1;
+            if let Some(v) = (0..rb.len()).filter_map(|i| u32_at(rb, i)).find(|&v| self.cls(v) == Some(C_BLOB)) {
+                data = w.blob(self.c, v)?;
             }
         }
-        let proxy = o
+        let proxy_uid = o
             .block(0x170D)
             .and_then(|b| u32_at(b, 0))
             .and_then(|p| self.block(p, 0x119))
             .and_then(|b| u32_at(b, 0))
-            .filter(|&v| self.cls(v) == Some(C_BLOB))
-            .and_then(|v| self.c.object(v).ok());
-        Graphic { uid: o.uid, transform: xf, bounds, data, uri, proxy }
+            .filter(|&v| self.cls(v) == Some(C_BLOB));
+        let proxy = match proxy_uid {
+            Some(v) => w.blob(self.c, v)?,
+            None => None,
+        };
+        Ok(Graphic { uid: o.uid, transform: xf, bounds, data, uri, proxy })
     }
 
-    fn item(&self, uid: u32, f2s: &HashMap<u32, u32>, depth: usize) -> Option<Item> {
-        if depth > MAX_DEPTH {
-            return None;
+    /// The page item `uid`, or None when it is not a page item, too deep, or one of its own
+    /// ancestors (a cycle). Fails once the document holds more than [`MAX_ITEMS`] items.
+    fn item(&self, uid: u32, w: &mut Walk<'_>, depth: usize) -> Result<Option<Item>> {
+        if depth > MAX_DEPTH || w.path.contains(&uid) {
+            return Ok(None);
         }
-        let o = self.objs.get(&uid)?;
+        let Some(o) = self.objs.get(&uid) else { return Ok(None) };
+        if o.cls != C_GROUP && o.cls != C_SPLINE {
+            return Ok(None);
+        }
+        w.items = w.items.saturating_add(1);
+        if w.items > MAX_ITEMS {
+            return Err(InddError::TooLarge("too many page items"));
+        }
+        w.budget.take(std::mem::size_of::<Item>(), "page items")?;
+        w.path.push(uid);
+        let it = self.item_body(o, w, depth);
+        w.path.pop();
+        it.map(Some)
+    }
+
+    fn item_body(&self, o: &Obj, w: &mut Walk<'_>, depth: usize) -> Result<Item> {
+        let uid = o.uid;
         let hidden = o.block(I_VISIBLE).and_then(|b| b.first()).is_some_and(|&v| v == 0);
         let mut it = Item {
             uid,
@@ -369,14 +437,17 @@ impl<'a> Builder<'a> {
         if o.cls == C_GROUP {
             it.kind = Kind::Group;
             it.transform = transform(o.block(0x40D).or_else(|| o.block(I_XFORM)));
-            it.children = self.kids(o).into_iter().filter_map(|k| self.item(k, f2s, depth + 1)).collect();
-            return Some(it);
-        }
-        if o.cls != C_SPLINE {
-            return None;
+            for k in self.kids(o) {
+                if let Some(ch) = self.item(k, w, depth + 1)? {
+                    it.children.push(ch);
+                }
+            }
+            return Ok(it);
         }
         it.transform = transform(o.block(I_XFORM));
         it.paths = o.block(I_PATH).map(parse_path).unwrap_or_default();
+        let points: usize = it.paths.iter().map(|p| p.points.len()).sum();
+        w.budget.take(points.saturating_mul(std::mem::size_of::<PathPoint>()), "path geometry")?;
         let ga = o.block(I_GATTR).map(attrs::graphic_attrs).unwrap_or_default();
         it.fill = attrs::uid(ga.get(&GA_FILL_COLOR));
         it.stroke = attrs::uid(ga.get(&GA_STROKE_COLOR));
@@ -387,17 +458,17 @@ impl<'a> Builder<'a> {
             let Some(ko) = self.objs.get(&k) else { continue };
             if ko.cls == C_MCOL {
                 it.kind = Kind::Text;
-                if let Some(st) = self.kids(ko).iter().find_map(|col| f2s.get(col)) {
+                if let Some(st) = self.kids(ko).iter().find_map(|col| w.f2s.get(col)) {
                     it.story = Some(*st);
                 }
             } else if GRAPHIC_CLASSES.contains(&ko.cls) {
                 it.kind = Kind::Graphic;
-                it.graphic = Some(self.graphic(ko));
-            } else if let Some(ch) = self.item(k, f2s, depth + 1) {
+                it.graphic = Some(self.graphic(ko, w)?);
+            } else if let Some(ch) = self.item(k, w, depth + 1)? {
                 it.children.push(ch);
             }
         }
-        Some(it)
+        Ok(it)
     }
 
     pub fn build(mut self) -> Result<Document> {
@@ -409,20 +480,30 @@ impl<'a> Builder<'a> {
         let names = self.layer_names();
         let doc = self.objs.get(&1).ok_or_else(|| InddError::Damaged("no document object".into()))?;
         let order = doc.block(0x301).map(|b| u32_list(b, 0)).unwrap_or_default();
-        let mut layers: Vec<(u32, String)> = order.iter().filter_map(|u| Some((*u, names.get(u)?.clone()))).collect();
-        for (u, n) in &names {
-            if !layers.iter().any(|(l, _)| l == u) {
+        let mut placed = std::collections::HashSet::new();
+        let mut layers: Vec<(u32, String)> = Vec::new();
+        for u in order.iter().chain(names.keys()) {
+            if let Some(n) = names.get(u)
+                && placed.insert(*u)
+            {
                 layers.push((*u, n.clone()));
             }
         }
         let spread_ids = doc.block(0x501).map(|b| u32_list(b, 0)).unwrap_or_default();
+        let mut walk = Walk { f2s: &f2s, path: Vec::new(), items: 0, visits: 0, blobs: HashMap::new(), budget: self.budget };
         let mut spreads = Vec::new();
         let mut page_size = (612.0, 792.0);
+        let mut seen_spreads = std::collections::HashSet::new();
         for sid in spread_ids {
+            // A spread listed twice is read once.
+            if !seen_spreads.insert(sid) {
+                continue;
+            }
             let Some(sp) = self.objs.get(&sid) else { continue };
             let (mut pages, mut items) = (Vec::new(), Vec::new());
             let layer_ids = sp.block(0x503).and_then(|sl| u32s(sl, 12, u32_at(sl, 8)? as usize)).unwrap_or_default();
             for lid in layer_ids {
+                walk.visit()?;
                 let Some(lo) = self.objs.get(&lid) else { continue };
                 let Some(kb) = lo.block(0x303) else { continue };
                 let (doc_layer, guides) = lo.block(0x302).map(|r| (u32_at(r, 0).unwrap_or(0), u16_at(r, 4).unwrap_or(0))).unwrap_or((0, 0));
@@ -431,6 +512,7 @@ impl<'a> Builder<'a> {
                 }
                 let kids = u32_at(kb, 8).and_then(|n| u32s(kb, 12, n as usize)).unwrap_or_default();
                 for k in kids {
+                    walk.visit()?;
                     let Some(ko) = self.objs.get(&k) else { continue };
                     if ko.cls == C_SPREAD_LAYER_PAGE {
                         let Some(pb) = ko.block(0x5DD).and_then(|b| Some([f64_at(b, 0)?, f64_at(b, 8)?, f64_at(b, 16)?, f64_at(b, 24)?])) else {
@@ -438,7 +520,7 @@ impl<'a> Builder<'a> {
                         };
                         pages.push(Page { uid: k, transform: transform(ko.block(0x5CC)), bounds: pb });
                         page_size = (pb[2] - pb[0], pb[3] - pb[1]);
-                    } else if let Some(mut it) = self.item(k, &f2s, 0) {
+                    } else if let Some(mut it) = self.item(k, &mut walk, 0)? {
                         it.layer = Some(doc_layer);
                         items.push(it);
                     }
@@ -498,11 +580,12 @@ pub fn parse_text(d: &[u8]) -> String {
     off += 2;
     let mut out = String::new();
     for _ in 0..n {
-        let (Some(size), Some(nchars), Some(tag)) = (u32_at(d, off), u32_at(d, off + 4), u16_at(d, off + 8)) else { break };
+        let (Some(o4), Some(o8), Some(o10)) = (off.checked_add(4), off.checked_add(8), off.checked_add(10)) else { break };
+        let (Some(size), Some(nchars), Some(tag)) = (u32_at(d, off), u32_at(d, o4), u16_at(d, o8)) else { break };
         if tag & 0x4000 != 0 {
-            out.push_str(&crate::text::cp1252(crate::bytes::clamp(d, off + 10, (tag & 0x3FFF) as usize)));
+            out.push_str(&crate::text::cp1252(crate::bytes::clamp(d, o10, (tag & 0x3FFF) as usize)));
         } else {
-            out.push_str(&crate::text::utf16le(crate::bytes::clamp(d, off + 10, (nchars as usize).saturating_mul(2))));
+            out.push_str(&crate::text::utf16le(crate::bytes::clamp(d, o10, (nchars as usize).saturating_mul(2))));
         }
         off = off.saturating_add(4).saturating_add(size as usize);
     }
@@ -516,10 +599,10 @@ pub fn parse_runs(d: &[u8]) -> Vec<Run> {
     off += 2;
     let mut runs = Vec::new();
     for _ in 0..n {
-        let (Some(size), Some(length), Some(style)) = (u32_at(d, off), u32_at(d, off + 4), u32_at(d, off + 8)) else { break };
-        let size = size as usize;
-        let body_end = off.saturating_add(4).saturating_add(size);
-        let body = d.get(off + 12..body_end.min(d.len())).unwrap_or(&[]);
+        let (Some(o4), Some(o8), Some(o12)) = (off.checked_add(4), off.checked_add(8), off.checked_add(12)) else { break };
+        let (Some(size), Some(length), Some(style)) = (u32_at(d, off), u32_at(d, o4), u32_at(d, o8)) else { break };
+        let body_end = o4.saturating_add(size as usize);
+        let body = d.get(o12..body_end.min(d.len())).unwrap_or(&[]);
         runs.push(Run { length: length as usize, style, attrs: attrs::text_attrs(body) });
         off = body_end;
     }

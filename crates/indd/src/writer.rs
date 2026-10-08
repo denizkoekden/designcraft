@@ -1,15 +1,16 @@
 //! IDML package writer for the document model.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::io::Write as _;
+use std::rc::Rc;
 
 use crate::attrs::{self, Attrs};
 use crate::bytes::u32s;
 use crate::model::{Document, Graphic, Item, Kind, Run, Story, Style, TA_AUTOLEAD, TA_COLOR, TA_FONT, TA_JUSTIFY, TA_LEADING, TA_SIZE, TA_STYLE};
 use crate::text::{base64, num, xml_escape as esc};
-use crate::{InddError, Result};
+use crate::{Budget, InddError, Result};
 
 const NS: &str = r#"xmlns:idPkg="http://ns.adobe.com/AdobeInDesign/idml/1.0/packaging""#;
 const HEAD: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n";
@@ -17,6 +18,11 @@ const DOM: &str = r#"DOMVersion="16.0""#;
 const MIMETYPE: &str = "application/vnd.adobe.indesign-idml-package";
 const LEADING_AUTO: f64 = 1e7;
 const MAX_DEPTH: usize = 32;
+/// The IDML text may be this many times the file size (XML spells out binary numbers, embedded
+/// files grow by a third in base64) …
+pub(crate) const OUTPUT_FACTOR: usize = 16;
+/// … and at least this large, for the fixed resources of small documents.
+pub(crate) const OUTPUT_FLOOR: usize = 4 << 20;
 
 fn justify(j: i64) -> Option<&'static str> {
     Some(match j {
@@ -37,9 +43,20 @@ fn matrix(t: &[f64; 6]) -> String {
     t.iter().map(|v| num(*v)).collect::<Vec<_>>().join(" ")
 }
 
+/// An embedded graphic ready for the XML: element name, base64 contents, PDF crop box.
+struct Encoded {
+    kind: &'static str,
+    base64: String,
+    pdf_box: Option<[f64; 4]>,
+}
+
 struct Writer<'a> {
     doc: &'a Document,
     root_style: Option<&'a Style>,
+    /// Encoded graphics by graphic UID (None: nothing embeddable).
+    graphics: HashMap<u32, Option<Rc<Encoded>>>,
+    /// Bytes of XML the package may still take.
+    budget: Budget,
 }
 
 impl<'a> Writer<'a> {
@@ -196,19 +213,23 @@ impl<'a> Writer<'a> {
             format!(r#"<Story Self="u{}">"#, st.uid),
             r#"<StoryPreference StoryOrientation="Horizontal"/>"#.into(),
         ];
+        let (mut para_at, mut char_at) = (RunCursor::default(), RunCursor::default());
         let mut start = 0usize;
         loop {
             let end = text.get(start..).and_then(|t| t.iter().position(|&c| c == '\r')).map(|p| start + p + 1).unwrap_or(n);
-            let pr = at(&para_runs, start);
+            let pr = para_at.at(&para_runs, start);
             let (pstyle, pover) = pr.map(|r| (Some(r.style), &r.attrs)).unwrap_or((None, &empty));
             let pa = self.resolve(pstyle, pover, None, &empty, false);
             out.push(format!(r#"<ParagraphStyleRange AppliedParagraphStyle="{}" {}>"#, esc(&self.style_ref(pstyle, false)), self.para_attrs(&pa)));
             let mut cuts: BTreeSet<usize> = [start, end].into_iter().collect();
-            cuts.extend(char_runs.iter().map(|(s, _, _)| *s).filter(|s| start < *s && *s < end));
+            // Run starts are sorted: only the runs starting inside this paragraph are looked at.
+            let first = char_runs.partition_point(|(s, _, _)| *s <= start);
+            let last = char_runs.partition_point(|(s, _, _)| *s < end).max(first);
+            cuts.extend(char_runs.get(first..last).unwrap_or(&[]).iter().map(|(s, _, _)| *s));
             let cuts: Vec<usize> = cuts.into_iter().collect();
             for w in cuts.windows(2) {
                 let (Some(&a), Some(&b)) = (w.first(), w.get(1)) else { continue };
-                let cr = at(&char_runs, a);
+                let cr = char_at.at(&char_runs, a);
                 let (cstyle, cover) = cr.map(|r| (Some(r.style), &r.attrs)).unwrap_or((None, &empty));
                 let ca = self.resolve(pstyle, pover, cstyle, cover, false);
                 let (cattrs, cprops) = self.char_attrs(&ca, true);
@@ -341,42 +362,95 @@ impl<'a> Writer<'a> {
         s
     }
 
-    fn item_xml(&self, it: &Item, layer: &str, depth: usize) -> String {
-        if depth > MAX_DEPTH {
-            return String::new();
+    /// Spends `n` bytes of the output budget.
+    fn charge(&mut self, n: usize) -> Result<()> {
+        self.budget.take(n, "generated IDML")
+    }
+
+    /// The encoded form of a graphic, built once per graphic UID.
+    fn encoded(&mut self, g: &Graphic) -> Result<Option<Rc<Encoded>>> {
+        if let Some(e) = self.graphics.get(&g.uid) {
+            return Ok(e.clone());
         }
+        let enc = match graphic_payload(g) {
+            Some((kind, payload)) => {
+                // Check before encoding (the base64 text is a third larger than the payload); each
+                // use of the text is charged where it is written.
+                if payload.len().div_ceil(3).saturating_mul(4) > self.budget.left() {
+                    return Err(InddError::TooLarge("generated IDML"));
+                }
+                let pdf_box = if kind == "PDF" { pdf_box(&payload) } else { None };
+                Some(Rc::new(Encoded { kind, base64: base64(&payload), pdf_box }))
+            }
+            None => None,
+        };
+        self.graphics.insert(g.uid, enc.clone());
+        Ok(enc)
+    }
+
+    /// Appends the XML of `it` and its children to `out`, within the output budget. The model is a
+    /// tree whose size the builder bounds, so this visits each item once.
+    fn item_xml(&mut self, it: &Item, layer: &str, depth: usize, out: &mut String) -> Result<()> {
+        if depth > MAX_DEPTH {
+            return Ok(());
+        }
+        let before = out.len();
         let xf = matrix(&it.transform);
-        let kids = |w: &Self| it.children.iter().map(|c| w.item_xml(c, layer, depth + 1)).collect::<String>();
         let vis = if it.hidden { r#" Visible="false""# } else { "" };
         match it.kind {
-            Kind::Group => format!(r#"<Group Self="u{}" ItemLayer="{layer}" ItemTransform="{xf}"{vis}>{}</Group>"#, it.uid, kids(self)),
+            Kind::Group => {
+                let _ = write!(out, r#"<Group Self="u{}" ItemLayer="{layer}" ItemTransform="{xf}"{vis}>"#, it.uid);
+                self.charge(out.len().saturating_sub(before))?;
+                for c in &it.children {
+                    self.item_xml(c, layer, depth + 1, out)?;
+                }
+                let tail = "</Group>";
+                self.charge(tail.len())?;
+                out.push_str(tail);
+                return Ok(());
+            }
             Kind::Text => {
                 let story = it.story.map(|s| format!("u{s}")).unwrap_or_else(|| "n".into());
-                format!(
+                let _ = write!(
+                    out,
                     r#"<TextFrame Self="u{}" ItemLayer="{layer}" ItemTransform="{xf}" {}{vis} ParentStory="{story}" PreviousTextFrame="n" NextTextFrame="n" ContentType="TextType">{}<TextFramePreference TextColumnCount="1" FirstBaselineOffset="AscentOffset" VerticalJustification="TopAlign"/></TextFrame>"#,
                     it.uid,
                     self.paint(it),
                     self.path_xml(it)
-                )
+                );
+                self.charge(out.len().saturating_sub(before))?;
             }
             Kind::Graphic | Kind::Shape => {
                 let inner = match (&it.graphic, it.kind) {
-                    (Some(g), Kind::Graphic) => graphic_xml_item(g),
+                    (Some(g), Kind::Graphic) => match self.encoded(g)? {
+                        Some(enc) => graphic_xml_item(g, &enc),
+                        None => String::new(),
+                    },
                     _ => String::new(),
                 };
                 let ctype = if it.kind == Kind::Graphic { "GraphicType" } else { "Unassigned" };
-                format!(
-                    r#"<Rectangle Self="u{}" ItemLayer="{layer}" ItemTransform="{xf}" {}{vis} ContentType="{ctype}">{}{inner}{}</Rectangle>"#,
+                let _ = write!(
+                    out,
+                    r#"<Rectangle Self="u{}" ItemLayer="{layer}" ItemTransform="{xf}" {}{vis} ContentType="{ctype}">{}"#,
                     it.uid,
                     self.paint(it),
                     self.path_xml(it),
-                    kids(self)
-                )
+                );
+                self.charge(out.len().saturating_sub(before))?;
+                self.charge(inner.len())?;
+                out.push_str(&inner);
+                for c in &it.children {
+                    self.item_xml(c, layer, depth + 1, out)?;
+                }
+                let tail = "</Rectangle>";
+                self.charge(tail.len())?;
+                out.push_str(tail);
             }
         }
+        Ok(())
     }
 
-    fn spread_xml(&self, sp: &crate::model::Spread) -> String {
+    fn spread_xml(&mut self, sp: &crate::model::Spread) -> Result<String> {
         let mut out = vec![
             HEAD.to_string(),
             format!("<idPkg:Spread {NS} {DOM}>"),
@@ -395,13 +469,17 @@ impl<'a> Writer<'a> {
                 matrix(&pg.transform)
             ));
         }
+        let fixed: usize = out.iter().map(|s| s.len().saturating_add(1)).sum();
+        self.charge(fixed)?;
         for it in &sp.items {
             let layer = it.layer.filter(|&l| l != 0).map(|l| format!("u{l}")).unwrap_or_else(|| "ul".into());
-            out.push(self.item_xml(it, &layer, 0));
+            let mut xml = String::new();
+            self.item_xml(it, &layer, 0, &mut xml)?;
+            out.push(xml);
         }
         out.push("</Spread>".into());
         out.push("</idPkg:Spread>".into());
-        out.join("\n")
+        Ok(out.join("\n"))
     }
 }
 
@@ -415,8 +493,20 @@ fn spans(runs: &[Run], n: usize) -> Vec<(usize, usize, &Run)> {
     out
 }
 
-fn at<'r>(sp: &[(usize, usize, &'r Run)], pos: usize) -> Option<&'r Run> {
-    sp.iter().find(|(s, e, _)| *s <= pos && pos < *e).map(|(_, _, r)| *r)
+/// Finds the run covering a position, for positions asked in increasing order: the spans from
+/// [`spans`] are contiguous and sorted, so the cursor only moves forward (linear over a story).
+#[derive(Default)]
+struct RunCursor {
+    i: usize,
+}
+
+impl RunCursor {
+    fn at<'r>(&mut self, sp: &[(usize, usize, &'r Run)], pos: usize) -> Option<&'r Run> {
+        while sp.get(self.i).is_some_and(|(_, e, _)| *e <= pos) {
+            self.i += 1;
+        }
+        sp.get(self.i).filter(|(s, e, _)| *s <= pos && pos < *e).map(|(_, _, r)| *r)
+    }
 }
 
 /// Embeddable graphic: PDF as is, EPS via its TIFF preview, else InDesign's proxy image.
@@ -452,12 +542,10 @@ fn raw_payload(g: &Graphic) -> Option<(&'static str, Cow<'_, [u8]>)> {
     g.proxy.as_deref().filter(|p| raster(p)).map(|p| ("Image", Cow::Borrowed(p)))
 }
 
-fn graphic_xml_item(g: &Graphic) -> String {
+fn graphic_xml_item(g: &Graphic, enc: &Encoded) -> String {
     let Some([mut l, mut t, mut r, mut b]) = g.bounds else { return String::new() };
-    let Some((kind, payload)) = graphic_payload(g) else { return String::new() };
-    if kind == "PDF"
-        && let Some([mx0, my0, mx1, my1]) = pdf_box(&payload)
-    {
+    let kind = enc.kind;
+    if let Some([mx0, my0, mx1, my1]) = enc.pdf_box {
         // PDF inner space keeps PDF y values but runs downward: y_inner = t + b - y_pdf.
         let (top, bottom) = (t, b);
         (l, t, r, b) = (mx0, top + bottom - my1, mx1, top + bottom - my0);
@@ -471,7 +559,7 @@ fn graphic_xml_item(g: &Graphic) -> String {
         r#"<{kind} Self="u{}" ItemTransform="{}"><Properties><Contents><![CDATA[{}]]></Contents><GraphicBounds Left="{}" Top="{}" Right="{}" Bottom="{}"/></Properties>{link}</{kind}>"#,
         g.uid,
         matrix(&g.transform),
-        base64(&payload),
+        enc.base64,
         num(l),
         num(t),
         num(r),
@@ -495,6 +583,8 @@ fn pdf_box(data: &[u8]) -> Option<[f64; 4]> {
 }
 
 fn literal_box(rest: &[u8]) -> Option<[f64; 4]> {
+    // A box is a few numbers; looking further would make a PDF full of keys quadratic.
+    let rest = crate::bytes::clamp(rest, 0, 256);
     let open = rest.iter().position(|c| !c.is_ascii_whitespace())?;
     if rest.get(open) != Some(&b'[') {
         return None;
@@ -515,12 +605,22 @@ fn walk<'i>(items: &'i [Item], out: &mut Vec<&'i Item>, depth: usize) {
     }
 }
 
+/// Default output budget of [`write`] (the import path derives one from the file size).
+const MAX_OUTPUT: usize = 1 << 30;
+
+/// The IDML package for a document model.
 pub fn write(d: &Document) -> Result<Vec<u8>> {
+    write_limited(d, Budget::for_input(MAX_OUTPUT, 1, 0))
+}
+
+pub(crate) fn write_limited(d: &Document, budget: Budget) -> Result<Vec<u8>> {
     let root_style = d.styles.values().find(|s| s.name == "[No paragraph style]" && s.attrs.len() > 100);
-    let w = Writer { doc: d, root_style };
+    let mut w = Writer { doc: d, root_style, graphics: HashMap::new(), budget };
     let mut files: Vec<(String, String)> = Vec::new();
-    files.push(("Resources/Graphic.xml".into(), w.graphic_xml()));
-    files.push(("Resources/Styles.xml".into(), w.styles_xml()));
+    let (graphic, styles) = (w.graphic_xml(), w.styles_xml());
+    w.charge(graphic.len().saturating_add(styles.len()))?;
+    files.push(("Resources/Graphic.xml".into(), graphic));
+    files.push(("Resources/Styles.xml".into(), styles));
     let pages: usize = d.spreads.iter().map(|s| s.pages.len()).sum();
     files.push((
         "Resources/Preferences.xml".into(),
@@ -558,13 +658,16 @@ pub fn write(d: &Document) -> Result<Vec<u8>> {
     ];
     for sp in &d.spreads {
         let name = format!("Spreads/Spread_u{}.xml", sp.uid);
-        files.push((name.clone(), w.spread_xml(sp)));
+        let xml = w.spread_xml(sp)?;
+        files.push((name.clone(), xml));
         refs.push(format!(r#"<idPkg:Spread src="{name}"/>"#));
     }
     let stories: BTreeMap<u32, &Story> = d.stories.iter().filter(|(u, _)| used_stories.contains(u)).map(|(u, s)| (*u, s)).collect();
     for (uid, st) in &stories {
         let name = format!("Stories/Story_u{uid}.xml");
-        files.push((name.clone(), w.story_xml(st)));
+        let xml = w.story_xml(st);
+        w.charge(xml.len())?;
+        files.push((name.clone(), xml));
         refs.push(format!(r#"<idPkg:Story src="{name}"/>"#));
     }
     let story_list = stories.keys().map(|u| format!("u{u}")).collect::<Vec<_>>().join(" ");

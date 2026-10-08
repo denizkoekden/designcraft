@@ -83,6 +83,11 @@ impl<'a> Container<'a> {
         Ok(c)
     }
 
+    /// Length of the whole file in bytes.
+    pub fn file_len(&self) -> usize {
+        self.data.len()
+    }
+
     fn footer(&self, phys: u32, field: usize) -> Option<u32> {
         let off = (phys as usize).checked_mul(PAGE)?.checked_add(PAGE - FOOTER + field * 4)?;
         u32_at(self.data, off)
@@ -169,6 +174,12 @@ impl<'a> Container<'a> {
 
     /// Assembled object bytes. Segment 1 holds the tail; full raw pages (2..n) come first.
     pub fn object(&self, uid: u32) -> Result<Vec<u8>> {
+        self.object_capped(uid, MAX_OBJECT)
+    }
+
+    /// Like [`Container::object`], failing with [`InddError::TooLarge`] once the object would
+    /// exceed `cap` bytes (segments may repeat, so the size is not bounded by the file size).
+    pub fn object_capped(&self, uid: u32, cap: usize) -> Result<Vec<u8>> {
         let mut segs = self.locations.get(&uid).cloned().ok_or_else(|| InddError::Damaged(format!("uid {uid} has no location")))?;
         segs.sort_by_key(|s| s.index);
         if !segs.is_empty() {
@@ -177,15 +188,21 @@ impl<'a> Container<'a> {
         let mut out = Vec::new();
         for s in segs {
             let len = s.length as usize;
-            if s.slot != 0 {
-                let r = self.record(s.page, s.slot)?;
-                out.extend_from_slice(clamp(&r, 0, len));
+            let record;
+            let piece = if s.slot != 0 {
+                record = self.record(s.page, s.slot)?;
+                clamp(&record, 0, len)
             } else {
-                out.extend_from_slice(clamp(self.page(s.page), 0, len));
-            }
-            if out.len() > MAX_OBJECT {
+                clamp(self.page(s.page), 0, len)
+            };
+            let total = out.len().saturating_add(piece.len());
+            if total > MAX_OBJECT {
                 return Err(InddError::Damaged(format!("object {uid} too large")));
             }
+            if total > cap {
+                return Err(InddError::TooLarge("object data"));
+            }
+            out.extend_from_slice(piece);
         }
         Ok(out)
     }

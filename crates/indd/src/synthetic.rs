@@ -83,6 +83,8 @@ pub struct Synth {
     pub split: Vec<u32>,
     /// Objects stored with one raw page plus a tail record.
     pub raw: Vec<u32>,
+    /// `(uid, n)`: the location entries of `uid` are written `n` times (hostile files reuse them).
+    pub repeat_locations: Vec<(u32, usize)>,
 }
 
 impl Default for Synth {
@@ -93,7 +95,7 @@ impl Default for Synth {
 
 impl Synth {
     pub fn new() -> Self {
-        Synth { objects: BTreeMap::new(), split: Vec::new(), raw: Vec::new() }
+        Synth { objects: BTreeMap::new(), split: Vec::new(), raw: Vec::new(), repeat_locations: Vec::new() }
     }
 
     pub fn add(&mut self, uid: u32, cls: u32, payload: Vec<u8>) {
@@ -184,7 +186,15 @@ impl Synth {
             }
             pages[phys as usize][..v.len()].copy_from_slice(&v);
         };
-        leaf(&mut pages, &mut footers, &mut l2p, &loc);
+        for &(uid, n) in &self.repeat_locations {
+            let mine: Vec<[u32; 4]> = loc.iter().filter(|e| e[0] == uid).copied().collect();
+            for _ in 1..n {
+                loc.extend_from_slice(&mine);
+            }
+        }
+        for chunk in loc.chunks(250) {
+            leaf(&mut pages, &mut footers, &mut l2p, chunk);
+        }
         let mut cls: Vec<[u32; 4]> = self.objects.iter().map(|(u, (c, _))| [*u, *c, 0, 0]).collect();
         cls.push([0x8000_0001, 0xC000_0000, 0, 0]);
         leaf(&mut pages, &mut footers, &mut l2p, &cls);
@@ -270,6 +280,18 @@ pub fn sample() -> Synth {
     s.add(71, 0x205, style("[No character style]", 0, &[]));
     s.add(72, 0x205, style("Accent", 71, &[(0x1B01, typed(0x1B05, &12u32.to_le_bytes())), (0x1B03, typed(0x1B28, &18.0f64.to_le_bytes()))]));
     s
+}
+
+/// Object payload from `(implementation, data)` blocks.
+pub fn object(list: &[(u32, Vec<u8>)]) -> Vec<u8> {
+    blocks(list)
+}
+
+/// Hierarchy block (0x15B) naming `kids` as the children of `parent`.
+pub fn hierarchy(parent: u32, kids: &[u32]) -> (u32, Vec<u8>) {
+    let mut v = u32s(&[20, parent, kids.len() as u32]);
+    v.extend_from_slice(&u32s(kids));
+    (0x15B, v)
 }
 
 pub fn rect_path(x0: f64, y0: f64, x1: f64, y1: f64) -> Vec<u8> {

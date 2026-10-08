@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use crate::bytes::u32_at;
 use crate::container::Container;
+use crate::{Budget, InddError, Result};
 
 #[derive(Debug, Clone)]
 pub struct Obj {
@@ -34,15 +35,26 @@ pub fn parse_blocks(raw: &[u8]) -> (Vec<(u32, Vec<u8>)>, bool) {
     (blocks, off == raw.len())
 }
 
-/// All readable objects keyed by UID. Unreadable objects are skipped.
-pub fn load(c: &Container<'_>) -> BTreeMap<u32, Obj> {
+/// All readable objects keyed by UID. Unreadable objects are skipped; the assembled bytes are
+/// charged to `budget`, and running out of it is an error.
+pub(crate) fn load(c: &Container<'_>, budget: &mut Budget) -> Result<BTreeMap<u32, Obj>> {
     let mut out = BTreeMap::new();
     for &uid in c.locations.keys() {
-        let Ok(raw) = c.object(uid) else { continue };
         let cls = c.classes.get(&uid).copied().unwrap_or(0);
         // Embedded files are kept out of the block model; the builder reads them on demand.
-        let (blocks, ok) = if cls == crate::model::C_BLOB { (Vec::new(), false) } else { parse_blocks(&raw) };
+        if cls == crate::model::C_BLOB {
+            out.insert(uid, Obj { uid, cls, blocks: Vec::new(), ok: false });
+            continue;
+        }
+        let raw = match c.object_capped(uid, budget.left()) {
+            Ok(raw) => raw,
+            Err(e @ InddError::TooLarge(_)) => return Err(e),
+            Err(_) => continue,
+        };
+        // The blocks are a copy of the raw bytes.
+        budget.take(raw.len().saturating_mul(2), "objects")?;
+        let (blocks, ok) = parse_blocks(&raw);
         out.insert(uid, Obj { uid, cls, blocks, ok });
     }
-    out
+    Ok(out)
 }

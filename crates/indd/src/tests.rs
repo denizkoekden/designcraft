@@ -5,7 +5,7 @@ use std::io::Read;
 
 use crate::container::{Container, PAGE};
 use crate::model::{parse_path, parse_runs, parse_text};
-use crate::synthetic::{rect_path, sample};
+use crate::synthetic::{hierarchy, object, rect_path, sample};
 use crate::{InddError, is_indd, to_idml, to_idml_named};
 
 fn unzip(idml: &[u8]) -> BTreeMap<String, String> {
@@ -86,10 +86,97 @@ fn hostile_input_never_panics() {
         d[i] ^= 0xFF;
         let _ = to_idml(&d);
     }
+    // Self-referencing and shared groups, and repeated segments, under corruption too.
+    for d in [with_group(&[30, 30, 31]).build(), with_group(&[31, 31, 30]).build()] {
+        for i in (0..d.len()).step_by(211) {
+            let mut d = d.clone();
+            d[i] ^= 0xFF;
+            let _ = to_idml(&d);
+        }
+    }
+    let mut s = sample();
+    s.add(95, 0x9999, vec![7; 3200]);
+    s.raw.push(95);
+    s.repeat_locations.push((95, 600));
+    let _ = to_idml(&s.build());
     // Pointer chains that loop must terminate.
     let mut d = doc.clone();
     d[0x3A8..0x3AC].copy_from_slice(&0u32.to_le_bytes());
     assert!(to_idml(&d).is_err());
+}
+
+/// Item 30 (a rectangle in the sample) becomes a group with the given children.
+fn with_group(kids: &[u32]) -> crate::synthetic::Synth {
+    let mut s = sample();
+    s.add(30, 0x401, object(&[hierarchy(21, kids)]));
+    s.add(31, 0x6201, object(&[(0x162B, rect_path(0.0, 0.0, 10.0, 10.0))]));
+    s
+}
+
+#[test]
+fn self_referencing_group_is_read_once() {
+    // Group 30 names itself twice: before the cycle check this expanded to 3^32 items.
+    let idml = to_idml(&with_group(&[30, 30, 31]).build()).unwrap();
+    let spread = &unzip(&idml)["Spreads/Spread_u20.xml"];
+    assert_eq!(spread.matches(r#"<Group Self="u30""#).count(), 1, "{spread}");
+    assert_eq!(spread.matches(r#"<Rectangle Self="u31""#).count(), 1, "{spread}");
+}
+
+#[test]
+fn shared_children_cannot_expand_exponentially() {
+    // Groups 100..131 each name the next one twice: 2^32 leaves unless the walk is bounded.
+    let mut s = with_group(&[100, 100]);
+    for g in 100..132u32 {
+        let next = if g == 131 { 31 } else { g + 1 };
+        s.add(g, 0x401, object(&[hierarchy(g.saturating_sub(1), &[next, next])]));
+    }
+    assert!(matches!(to_idml(&s.build()), Err(InddError::TooLarge(_))));
+    // A legitimately shared child is still read (once per use).
+    let idml = to_idml(&with_group(&[31, 31]).build()).unwrap();
+    assert_eq!(unzip(&idml)["Spreads/Spread_u20.xml"].matches(r#"<Rectangle Self="u31""#).count(), 2);
+}
+
+#[test]
+fn repeated_segments_hit_the_memory_budget() {
+    // One 3000-byte raw page named 12,000 times would assemble 36 MB from a ~420 KB file.
+    let mut s = sample();
+    s.add(95, 0x9999, vec![7; 3200]);
+    s.raw.push(95);
+    s.repeat_locations.push((95, 12_000));
+    let doc = s.build();
+    assert!(doc.len() < 500_000, "{}", doc.len());
+    assert!(matches!(to_idml(&doc), Err(InddError::TooLarge(_))));
+    // The same object named once converts.
+    let mut s = sample();
+    s.add(95, 0x9999, vec![7; 3200]);
+    s.raw.push(95);
+    assert!(to_idml(&s.build()).is_ok());
+}
+
+#[test]
+fn shared_embedded_file_is_read_once_and_output_is_budgeted() {
+    // Two frames placing the same embedded PDF share one copy of it.
+    let mut s = with_group(&[31, 31]);
+    let mut pdf = b"%PDF-1.4 /MediaBox [0 0 10 10] ".to_vec();
+    pdf.resize(3000, b' ');
+    s.add(80, 0x129, pdf);
+    s.add(81, 0x8C41, object(&[(0x8C92, [b"file:/x.pdf\0".to_vec(), 80u32.to_le_bytes().to_vec()].concat())]));
+    s.add(82, 0x8C42, object(&[(0x8C9B, [vec![0; 8], 81u32.to_le_bytes().to_vec()].concat())]));
+    let bounds: Vec<u8> = [0.0f64, 0.0, 10.0, 10.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+    s.add(83, 0x2501, object(&[(0x8CBC, [vec![0; 8], 82u32.to_le_bytes().to_vec()].concat()), (0x1633, bounds)]));
+    s.add(31, 0x6201, object(&[(0x162B, rect_path(0.0, 0.0, 10.0, 10.0)), hierarchy(30, &[83])]));
+    let bytes = s.build();
+    let c = Container::parse(&bytes).unwrap();
+    let doc = crate::model::Builder::new(&c).unwrap().build().unwrap();
+    let group = doc.spreads[0].items.iter().find(|i| i.uid == 30).unwrap();
+    let data: Vec<_> = group.children.iter().map(|k| k.graphic.as_ref().unwrap().data.clone().unwrap()).collect();
+    assert_eq!(data.len(), 2);
+    assert!(std::sync::Arc::ptr_eq(&data[0], &data[1]));
+    let idml = to_idml(&bytes).unwrap();
+    assert_eq!(unzip(&idml)["Spreads/Spread_u20.xml"].matches("<PDF Self=\"u83\"").count(), 2);
+    // Each use of the graphic counts against the output budget.
+    let tight = crate::writer::write_limited(&doc, crate::Budget::for_input(12_000, 1, 0));
+    assert!(matches!(tight, Err(InddError::TooLarge(_))));
 }
 
 #[test]
@@ -156,6 +243,16 @@ fn palette_tiffs_become_png() {
     }
     // PackBits repeat runs and truncated strips do not panic.
     let _ = crate::tiff::palette_to_png(&palette_tiff(32773, &[0x81, 1]));
+    // A header claiming 8192×8192 pixels with four bytes of data is rejected before the image is
+    // allocated, and strip offsets near the end of the address space do not overflow.
+    let mut huge = palette_tiff(1, &[1, 255, 2, 128]);
+    huge[18..20].copy_from_slice(&8192u16.to_le_bytes());
+    huge[30..32].copy_from_slice(&8192u16.to_le_bytes());
+    assert!(crate::tiff::palette_to_png(&huge).is_none());
+    let mut far = palette_tiff(1, &[1, 255, 2, 128]);
+    let map_entry = 10 + 12 * 8 + 8;
+    far[map_entry..map_entry + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(crate::tiff::palette_to_png(&far).is_none());
     let t = palette_tiff(1, &[1, 255, 2, 128]);
     for cut in 0..t.len() {
         let _ = crate::tiff::palette_to_png(&t[..cut]);
